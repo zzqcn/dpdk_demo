@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(C) 2020 Marvell International Ltd.
+
+# binary name
+APP = graph-mt
+
+# all source are stored in SRCS-y
+SRCS-y := $(wildcard *.c)
+
+# Build using pkg-config variables if possible
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+$(error "no installation of DPDK found")
+endif
+
+all: shared
+.PHONY: shared static
+shared: build/$(APP)-shared
+	ln -sf $(APP)-shared build/$(APP)
+static: build/$(APP)-static
+	ln -sf $(APP)-static build/$(APP)
+
+PKGCONF=pkg-config --define-prefix
+
+PC_FILE := $(shell $(PKGCONF) --path libdpdk)
+CFLAGS += -O0 -g $(shell $(PKGCONF) --cflags libdpdk) -DALLOW_EXPERIMENTAL_API
+LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
+LDFLAGS_STATIC = -Wl,-Bstatic $(shell $(PKGCONF) --static --libs libdpdk)
+
+build/$(APP)-shared: $(SRCS-y) Makefile $(PC_FILE) | build
+	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
+
+build/$(APP)-static: $(SRCS-y) Makefile $(PC_FILE) | build
+	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
+
+build:
+	@mkdir -p $@
+
+.PHONY: clean
+clean:
+	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared
+	test -d build && rmdir -p build || true
