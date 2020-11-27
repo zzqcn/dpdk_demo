@@ -1,4 +1,4 @@
-project('l2fwd_cuckoo_hash', 'c')
+project('l2fwd', 'c')
 
 if get_option('buildtype').startswith('debug')
     add_project_arguments('-DDEBUG', language: 'c')
@@ -11,4 +11,4 @@ sources = files(
     'main.c'
 )
 
-executable('l2fwd_cuckoo_hash', sources, dependencies: dpdk_dep)
+executable('l2fwd', sources, dependencies: dpdk_dep)

@@ -49,6 +49,7 @@
 #include <rte_memory.h>
 #include <rte_memcpy.h>
 #include <rte_memzone.h>
+#include <rte_malloc.h>
 #include <rte_eal.h>
 #include <rte_per_lcore.h>
 #include <rte_launch.h>
@@ -100,6 +101,7 @@ static int promiscuous_on;
 static int numa_on = 1; /**< NUMA is enabled by default. */
 static int parse_ptype; /**< Parse packet type using rx callback, and */
                         /**< disabled by default */
+static int lock_free_on;
 
 /* Global variables. */
 
@@ -122,13 +124,10 @@ struct lcore_conf lcore_conf[RTE_MAX_LCORE];
 struct l2fwd_main_ctx
 {
     struct rte_hash *flow_table;
+    struct rte_hash_rcu_config *rcu_config;
+    unsigned master_lcore_id;
     rte_atomic32_t flow_count;
 } l2fwd_main;
-
-/* rx/tx packet statistics */
-#ifdef STAT
-struct port_stat port_stat[RTE_MAX_ETHPORTS];
-#endif
 
 /* flow table */
 struct ipv4_5tuple
@@ -173,22 +172,28 @@ static inline xmm_t mask_key(void *key, xmm_t mask)
     return _mm_and_si128(data, mask);
 }
 
+// IPv4地址格式化
+/* not defined under linux */
+#ifndef NIPQUAD
+#define NIPQUAD_FMT "%u.%u.%u.%u"
+#define NIPQUAD(addr)                                \
+    (unsigned)((const unsigned char *)&addr)[0],     \
+        (unsigned)((const unsigned char *)&addr)[1], \
+        (unsigned)((const unsigned char *)&addr)[2], \
+        (unsigned)((const unsigned char *)&addr)[3]
+#endif
+
 static void print_flow_key(const union flow_key *key)
 {
-    printf(
-        "%d.%d.%d.%d\t"
-        "%d.%d.%d.%d\t"
-        "%u\t%u\t%u\n",
-        (key->ip_src) & 0xff, (key->ip_src >> 8) & 0xff,
-        (key->ip_src >> 16) & 0xff, (key->ip_src >> 24), (key->ip_dst) & 0xff,
-        (key->ip_dst >> 8) & 0xff, (key->ip_dst >> 16) & 0xff,
-        (key->ip_dst >> 24), key->proto, rte_be_to_cpu_16(key->port_src),
-        rte_be_to_cpu_16(key->port_dst));
+    printf(NIPQUAD_FMT ":%u " NIPQUAD_FMT ":%u %hhu\n", NIPQUAD(key->ip_src),
+           rte_be_to_cpu_16(key->port_src), NIPQUAD(key->ip_dst),
+           rte_be_to_cpu_16(key->port_dst), key->proto);
 }
 
 static void process_flow_table(struct lcore_conf *qconf, struct rte_mbuf *m)
 {
-    int ret;
+    int ret, lock_free = lock_free_on;
+    unsigned lcore_id = rte_lcore_id();
     union flow_key key;
 
     key.xmm = mask_key(rte_pktmbuf_mtod(m, void *) + RTE_ETHER_HDR_LEN +
@@ -205,7 +210,15 @@ static void process_flow_table(struct lcore_conf *qconf, struct rte_mbuf *m)
         key.port_dst = port_tmp;
     }
 
+    if (lock_free) {
+        rte_rcu_qsbr_thread_online(l2fwd_main.rcu_config->v, lcore_id);
+    }
     ret = rte_hash_lookup(l2fwd_main.flow_table, &key);
+    if (lock_free) {
+        rte_rcu_qsbr_quiescent(l2fwd_main.rcu_config->v, lcore_id);
+        rte_rcu_qsbr_thread_offline(l2fwd_main.rcu_config->v, lcore_id);
+    }
+
     if (ret < 0) {
         // print_flow_key(&key);
         if (rte_hash_add_key(l2fwd_main.flow_table, &key) < 0) {
@@ -222,48 +235,11 @@ static void print_flow_table(const struct rte_hash *t)
     const union flow_key *key;
     void *data;
 
-    while (rte_hash_iterate(t, (const void **)&key, &data, &next)) {
+    while (rte_hash_iterate(t, (const void **)&key, &data, &next) >= 0) {
         printf("%u\t", next);
         print_flow_key(key);
     }
 }
-
-// static void
-// convert_ipv4_5tuple(struct ipv4_5tuple *key1,
-//                 union flow_key *key2)
-// {
-//     key2->ip_dst = rte_cpu_to_be_32(key1->ip_dst);
-//     key2->ip_src = rte_cpu_to_be_32(key1->ip_src);
-//     key2->port_dst = rte_cpu_to_be_16(key1->port_dst);
-//     key2->port_src = rte_cpu_to_be_16(key1->port_src);
-//     key2->proto = key1->proto;
-//     key2->pad0 = 0;
-//     key2->pad1 = 0;
-// }
-
-// 此哈希函数会带来非常大的冲突, 故使用rte_jhash
-// static inline uint32_t
-// ipv4_hash_crc(const void* data, __rte_unused uint32_t data_len, uint32_t
-// init_val)
-// {
-//     const union flow_key* k;
-//     uint32_t t;
-//     const uint32_t* p;
-
-//     k = data;
-//     t = k->proto;
-//     p = (const uint32_t *)&k->port_src;
-
-//     init_val = rte_hash_crc_4byte(t, init_val);
-//     init_val = rte_hash_crc_4byte(k->ip_src, init_val);
-//     init_val = rte_hash_crc_4byte(k->ip_dst, init_val);
-//     init_val = rte_hash_crc_4byte(*p, init_val);
-
-//     printf("hash: %x\n", init_val);
-
-//     return init_val;
-// }
-
 
 struct lcore_params
 {
@@ -286,19 +262,31 @@ static struct lcore_params *lcore_params = lcore_params_array_default;
 static uint16_t nb_lcore_params =
     sizeof(lcore_params_array_default) / sizeof(lcore_params_array_default[0]);
 
+// clang-format off
+// 用于82599网卡, XL710无效
+static uint8_t RSS_INTEL_KEY[40] =
+{
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+    0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A
+};
+// clang-format on
+
 static struct rte_eth_conf port_conf = {
     .rxmode =
         {
             .mq_mode = ETH_MQ_RX_RSS,
             .split_hdr_size = 0,
         },
-#if 0
+#ifdef NIC_82599
     .rx_adv_conf =
         {
             .rss_conf =
                 {
-                    .rss_key = NULL,
-                    .rss_hf = ETH_RSS_IP | ETH_RSS_UDP | ETH_RSS_TCP,
+                    .rss_key = RSS_INTEL_KEY,
+                    .rss_key_len = 40,
+                    .rss_hf = ETH_RSS_IPV4 | ETH_RSS_UDP | ETH_RSS_TCP,
                 },
         },
 #endif
@@ -394,24 +382,51 @@ static int init_lcore_rx_queues(void)
     return 0;
 }
 
-static void init_l2fwd_main(void)
+static void init_l2fwd_main(int socket_id)
 {
+    uint8_t extra_flag = 0;
     struct rte_hash_parameters ipv4_table_params = {
         .name = "flow_table",
         .entries = FLOW_MAX,
         .key_len = sizeof(union flow_key),
         // .hash_func = rte_jhash,  // ipv4_hash_crc,
         .hash_func_init_val = 0xfee1900d,
-        .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF,
-        .socket_id = 0, /** @note 仅在NUMA node 0上创建hash table */
+        .socket_id = socket_id,
     };
 
     mask_v4 = (rte_xmm_t){
         .u32 = {BIT_8_TO_15, ALL_32_BITS, ALL_32_BITS, ALL_32_BITS}};
 
+    if (lock_free_on)
+        extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF |
+                     RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD;
+    else
+        extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY |
+                     RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD;
+
+    ipv4_table_params.extra_flag = extra_flag;
     l2fwd_main.flow_table = rte_hash_create(&ipv4_table_params);
     if (NULL == l2fwd_main.flow_table)
         rte_exit(EXIT_FAILURE, "create ipv4 flow table failed\n");
+
+    if (lock_free_on) {
+        size_t sz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+        struct rte_rcu_qsbr *rv = (struct rte_rcu_qsbr *)rte_zmalloc_socket(
+            NULL, sz, RTE_CACHE_LINE_SIZE, socket_id);
+        if (rte_rcu_qsbr_init(rv, RTE_MAX_LCORE) != 0)
+            rte_exit(EXIT_FAILURE, "QSBR Variable init failed\n");
+
+        l2fwd_main.rcu_config =
+            (struct rte_hash_rcu_config *)rte_zmalloc_socket(
+                NULL, sizeof(struct rte_hash_rcu_config), RTE_CACHE_LINE_SIZE,
+                socket_id);
+        l2fwd_main.rcu_config->v = rv;
+
+        if (rte_hash_rcu_qsbr_add(l2fwd_main.flow_table,
+                                  l2fwd_main.rcu_config) < 0)
+            rte_exit(EXIT_FAILURE, "RCU init in hash failed\n");
+    }
+
     rte_atomic32_init(&l2fwd_main.flow_count);
 }
 
@@ -427,7 +442,8 @@ static void print_usage(const char *prgname)
         " [--enable-jumbo [--max-pkt-len PKTLEN]]"
         " [--no-numa]"
         " [--ipv6]"
-        " [--parse-ptype]\n\n"
+        " [--parse-ptype]"
+        " [--lock-free]\n\n"
 
         "  -p PORTMASK: Hexadecimal bitmask of ports to configure\n"
         "  -P : Enable promiscuous mode\n"
@@ -437,7 +453,8 @@ static void print_usage(const char *prgname)
         "                 maximum packet length in decimal (64-9600)\n"
         "  --no-numa: Disable numa awareness\n"
         "  --ipv6: Set if running ipv6 packets\n"
-        "  --parse-ptype: Set to use software to analyze packet type\n\n",
+        "  --parse-ptype: Set to use software to analyze packet type\n"
+        "  --lock-free: use lock-free rte_hash\n\n",
         prgname);
 }
 
@@ -560,6 +577,7 @@ static void parse_eth_dest(const char *optarg)
 #define CMD_LINE_OPT_NO_NUMA "no-numa"
 #define CMD_LINE_OPT_IPV6 "ipv6"
 #define CMD_LINE_OPT_PARSE_PTYPE "parse-ptype"
+#define CMD_LINE_OPT_LOCK_FREE "lock-free"
 
 /*
  * This expression is used to calculate the number of mbufs needed
@@ -583,9 +601,14 @@ static int parse_args(int argc, char **argv)
     int option_index;
     char *prgname = argv[0];
     static struct option lgopts[] = {
-        {CMD_LINE_OPT_CONFIG, 1, 0, 0},      {CMD_LINE_OPT_ETH_DEST, 1, 0, 0},
-        {CMD_LINE_OPT_NO_NUMA, 0, 0, 0},     {CMD_LINE_OPT_IPV6, 0, 0, 0},
-        {CMD_LINE_OPT_PARSE_PTYPE, 0, 0, 0}, {NULL, 0, 0, 0}};
+        {CMD_LINE_OPT_CONFIG, 1, 0, 0},
+        {CMD_LINE_OPT_ETH_DEST, 1, 0, 0},
+        {CMD_LINE_OPT_NO_NUMA, 0, 0, 0},
+        {CMD_LINE_OPT_IPV6, 0, 0, 0},
+        {CMD_LINE_OPT_PARSE_PTYPE, 0, 0, 0},
+        {CMD_LINE_OPT_LOCK_FREE, 0, 0, 0},
+        {NULL, 0, 0, 0},
+    };
 
     argvopt = argv;
 
@@ -683,6 +706,12 @@ static int parse_args(int argc, char **argv)
                          sizeof(CMD_LINE_OPT_PARSE_PTYPE))) {
                 printf("soft parse-ptype is enabled\n");
                 parse_ptype = 1;
+            }
+
+            if (!strncmp(lgopts[option_index].name, CMD_LINE_OPT_LOCK_FREE,
+                         sizeof(CMD_LINE_OPT_LOCK_FREE))) {
+                printf("lock-free is enabled\n");
+                lock_free_on = 1;
             }
 
             break;
@@ -926,7 +955,7 @@ prepare_ptype_parser(uint16_t port_id, uint16_t queue_id)
 #endif
 
 
-static int main_loop(__attribute__((unused)) void *arg)
+static int worker_loop(__attribute__((unused)) void *arg)
 {
     struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
     unsigned lcore_id;
@@ -948,6 +977,12 @@ static int main_loop(__attribute__((unused)) void *arg)
     if (qconf->n_rx_queue == 0) {
         RTE_LOG(INFO, L2FWD, "lcore %u has nothing to do\n", lcore_id);
         return 0;
+    }
+
+    if (lock_free_on) {
+        if (rte_rcu_qsbr_thread_register(l2fwd_main.rcu_config->v, lcore_id) !=
+            0)
+            rte_exit(EXIT_FAILURE, "Register thread %u failed\n", lcore_id);
     }
 
     RTE_LOG(INFO, L2FWD, "entering main loop on lcore %u\n", lcore_id);
@@ -992,7 +1027,6 @@ static int main_loop(__attribute__((unused)) void *arg)
             if (nb_rx == 0)
                 continue;
 #ifdef STAT
-            port_stat[port_id].rx_pkt_cnt += nb_rx;
             qconf->rx_pkt_cnt[port_id] += nb_rx;
 #endif
 
@@ -1004,6 +1038,9 @@ static int main_loop(__attribute__((unused)) void *arg)
             }
         }
     }
+
+    if (lock_free_on)
+        rte_rcu_qsbr_thread_unregister(l2fwd_main.rcu_config->v, lcore_id);
 
     return 0;
 }
@@ -1187,7 +1224,7 @@ int main(int argc, char **argv)
             rte_eth_promiscuous_enable(port_id);
     }
 
-    init_l2fwd_main();
+    init_l2fwd_main(rte_socket_id());
     printf("\n");
 
 #if 0
@@ -1204,31 +1241,18 @@ int main(int argc, char **argv)
     }
 #endif
 
-
     check_all_ports_link_status(enabled_port_mask);
 
-    ret = 0;
-    /* launch per-lcore init on every lcore */
-    // rte_eal_mp_remote_launch(l3fwd_lkp.main_loop, NULL, CALL_MASTER);
-    rte_eal_mp_remote_launch(main_loop, NULL, CALL_MASTER);
-    RTE_LCORE_FOREACH_SLAVE(lcore_id)
-    {
-        if (rte_eal_wait_lcore(lcore_id) < 0) {
-            ret = -1;
-            break;
-        }
-    }
+    // RTE_LCORE_FOREACH(lcore_id)
+    // {
+    //     rte_eal_remote_launch(worker_loop, NULL, lcore_id);
+    // }
+    rte_eal_mp_remote_launch(worker_loop, NULL, CALL_MAIN);
+    rte_eal_mp_wait_lcore();
 
     dump_port_info();
 
 #ifdef STAT
-    RTE_ETH_FOREACH_DEV(port_id)
-    {
-        if ((enabled_port_mask & (1 << port_id)) == 0)
-            continue;
-        printf("port%d rx: %16lu    tx: %16lu\n", port_id,
-               port_stat[port_id].rx_pkt_cnt, port_stat[port_id].tx_pkt_cnt);
-    }
     printf("=============================================================\n");
     for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
         if (rte_lcore_is_enabled(lcore_id) == 0)
@@ -1247,9 +1271,17 @@ int main(int argc, char **argv)
     }
 #endif
 
-
     printf("flow count: %d, total: %d\n",
            rte_atomic32_read(&l2fwd_main.flow_count), FLOW_MAX);
+#ifdef DEBUG
+    print_flow_table(l2fwd_main.flow_table);
+#endif
+
+    rte_hash_free(l2fwd_main.flow_table);
+    if (l2fwd_main.rcu_config) {
+        rte_free(l2fwd_main.rcu_config->v);
+        rte_free(l2fwd_main.rcu_config);
+    }
 
     /* stop ports */
     RTE_ETH_FOREACH_DEV(port_id)

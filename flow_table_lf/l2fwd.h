@@ -37,8 +37,9 @@
 #include <rte_vect.h>
 #include <rte_ether.h>
 
-//#define STAT
+#define STAT
 #define DRAIN
+#define NIC_82599   1
 
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
 
@@ -96,18 +97,6 @@ struct lcore_conf
 #endif
 } __rte_cache_aligned;
 
-#ifdef STAT
-/* Per-port statistics struct */
-struct l2fwd_port_statistics
-{
-    uint64_t tx;
-    uint64_t rx;
-    uint64_t dropped;
-} __rte_cache_aligned;
-
-extern struct l2fwd_port_statistics port_stats[RTE_MAX_ETHPORTS];
-#endif
-
 extern volatile bool force_quit;
 
 /* ethernet addresses of ports */
@@ -136,7 +125,6 @@ static inline int send_burst(struct lcore_conf *qconf, uint16_t n, uint8_t port)
 
     ret = rte_eth_tx_burst(port, queueid, m_table, n);
 #ifdef STAT
-    port_stats[port].tx_pkt_cnt += ret;
     qconf->tx_pkt_cnt[port] += ret;
 #endif
     if (unlikely(ret < n)) {
