@@ -779,8 +779,10 @@ static void check_all_ports_link_status(uint32_t port_mask)
 {
 #define CHECK_INTERVAL 100 /* 100ms */
 #define MAX_CHECK_TIME 90  /* 9s (90 * 100ms) in total */
+    int ret;
     uint16_t port_id, count, all_ports_up, print_flag = 0;
     struct rte_eth_link link;
+    char link_status_text[RTE_ETH_LINK_MAX_STR_LEN];
 
     printf("Checking link status...\n");
     fflush(stdout);
@@ -795,19 +797,19 @@ static void check_all_ports_link_status(uint32_t port_mask)
             if ((port_mask & (1 << port_id)) == 0)
                 continue;
             memset(&link, 0, sizeof(link));
-            rte_eth_link_get_nowait(port_id, &link);
+            ret = rte_eth_link_get_nowait(port_id, &link);
+            if (ret < 0) {
+                all_ports_up = 0;
+                if (print_flag == 1)
+                    printf("Port %u link get failed: %s\n", port_id,
+                           rte_strerror(-ret));
+                continue;
+            }
             /* print link status if flag set */
             if (print_flag == 1) {
-                if (link.link_status)
-                    printf(
-                        "Port %u Link Up - speed %u "
-                        "Mbps - %s\n",
-                        port_id, link.link_speed,
-                        (link.link_duplex == ETH_LINK_FULL_DUPLEX)
-                            ? ("full-duplex")
-                            : ("half-duplex\n"));
-                else
-                    printf("Port %u Link Down\n", port_id);
+                rte_eth_link_to_str(link_status_text, sizeof(link_status_text),
+                                    &link);
+                printf("Port %d %s\n", port_id, link_status_text);
                 continue;
             }
             /* clear all_ports_up flag if any link down */
