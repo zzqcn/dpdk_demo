@@ -5,10 +5,22 @@ if get_option('buildtype').startswith('debug')
 endif
 add_project_arguments('-DALLOW_EXPERIMENTAL_API', language: 'c')
 
-dpdk_dep = dependency('libdpdk')
+dpdk_dep = declare_dependency(
+    dependencies: dependency('libdpdk'),
+    link_args: [
+        '-L/usr/local/lib64',
+        '-Wl,--no-as-needed',
+        '-lrte_net_vmxnet3',
+        '-lrte_net_ixgbe',
+        '-lrte_net_i40e',
+        '-lrte_mempool_ring'
+    ],
+)
 
 sources = files(
     'main.c'
 )
 
-executable('l2fwd', sources, dependencies: dpdk_dep)
+executable('l2fwd',sources,
+    dependencies: dpdk_dep
+)

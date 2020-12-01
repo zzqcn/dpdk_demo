@@ -1096,6 +1096,8 @@ int main(int argc, char **argv)
 
     nb_ports = rte_eth_dev_count_avail();
 
+    printf("avail ports: %u, port mask: 0x%x\n", nb_ports, enabled_port_mask);
+
     /* initialize all ports */
     RTE_ETH_FOREACH_DEV(port_id)
     {
@@ -1190,7 +1192,7 @@ int main(int argc, char **argv)
             else
                 socket_id = 0;
 
-            printf("rxq: %u,%u,%u,%u ", port_id, queue_id, lcore_id, socket_id);
+            printf("rxq: %u,%u,%u,%u\n", port_id, queue_id, lcore_id, socket_id);
             fflush(stdout);
 
             ret = rte_eth_rx_queue_setup(port_id, queue_id, nb_rxd, socket_id,
