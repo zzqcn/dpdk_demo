@@ -9,7 +9,6 @@ dpdk_dep = declare_dependency(
     dependencies: dependency('libdpdk'),
     link_args: [
         '-L/usr/local/lib64',
-        '-Wl,--no-as-needed',
         '-lrte_net_vmxnet3',
         '-lrte_net_ixgbe',
         '-lrte_net_i40e',

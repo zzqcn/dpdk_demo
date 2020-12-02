@@ -9,13 +9,13 @@ dpdk_dep = declare_dependency(
     dependencies: dependency('libdpdk'),
     link_args: [
         '-L/usr/local/lib64',
-        '-Wl,--no-as-needed',
         '-lrte_net_vmxnet3',
         '-lrte_net_ixgbe',
         '-lrte_net_i40e',
-        '-lrte_mempool_ring'
+        '-lrte_mempool_ring',
     ],
 )
+#dpdk_dep = dependency('libdpdk', static: true)
 
 sources = files(
     'main.c'
