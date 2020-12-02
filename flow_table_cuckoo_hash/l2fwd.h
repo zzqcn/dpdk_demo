@@ -83,6 +83,8 @@ struct lcore_rx_queue
     uint8_t queue_id;
 } __rte_cache_aligned;
 
+struct rte_hash;
+
 struct lcore_conf
 {
     uint16_t n_rx_queue;
@@ -91,6 +93,10 @@ struct lcore_conf
     uint16_t tx_port_id[RTE_MAX_ETHPORTS];
     uint16_t tx_queue_id[RTE_MAX_ETHPORTS];
     struct mbuf_table tx_mbufs[RTE_MAX_ETHPORTS];
+
+    struct rte_hash* flow_table;
+    uint32_t flow_count;
+
 #ifdef STAT
     uint64_t rx_pkt_cnt[RTE_MAX_ETHPORTS];
     uint64_t tx_pkt_cnt[RTE_MAX_ETHPORTS];

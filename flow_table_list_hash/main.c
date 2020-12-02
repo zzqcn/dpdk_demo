@@ -70,9 +70,7 @@
 #include <rte_net.h>
 #include <rte_string_fns.h>
 #include <rte_cpuflags.h>
-#include <rte_hash_crc.h>
 #include <rte_jhash.h>
-#include <rte_hash.h>
 
 // #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -90,6 +88,8 @@
 
 #define MAX_LCORE_PARAMS 1024
 
+#define FLOW_MAX_DEFAULT (1 * 1024 * 1024)
+
 /* Static global variables used within this file. */
 static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
@@ -97,11 +97,12 @@ static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 /**< Ports set in promiscuous mode off by default. */
 static int promiscuous_on;
 
-
 static int numa_on = 1; /**< NUMA is enabled by default. */
 static int parse_ptype; /**< Parse packet type using rx callback, and */
                         /**< disabled by default */
-static int lock_free_on;
+
+static unsigned flow_per_lcore = FLOW_MAX_DEFAULT;
+static unsigned flow_bucket_ratio = 2;
 
 /* Global variables. */
 
@@ -120,14 +121,6 @@ uint32_t enabled_port_mask;
 int ipv6; /**< ipv6 is false by default. */
 
 struct lcore_conf lcore_conf[RTE_MAX_LCORE];
-
-struct l2fwd_main_ctx
-{
-    struct rte_hash *flow_table;
-    struct rte_hash_rcu_config *rcu_config;
-    unsigned master_lcore_id;
-    rte_atomic32_t flow_count;
-} l2fwd_main;
 
 /* flow table */
 struct ipv4_5tuple
@@ -154,6 +147,27 @@ union flow_key
     xmm_t xmm;
 };
 
+struct flow
+{
+    union flow_key key;
+    struct flow **prev_next; /**< hash桶链表项 */
+    struct flow *next;       /**< hash桶链表项 */
+};
+
+#define FLOW_HASH_LIST_ADD_TAIL(p, tail)   \
+    (p)->prev_next = &(tail);              \
+    (p)->next = (tail);                    \
+    (tail) = (p);                          \
+    if (NULL != (p)->next) {               \
+        (p)->next->prev_next = &(p)->next; \
+    }
+
+#define FLOW_HASH_LIST_DELETE(p)               \
+    *(p)->prev_next = (p)->next;               \
+    if (NULL != (p)->next) {                   \
+        (p)->next->prev_next = (p)->prev_next; \
+    }
+
 // struct flow_value {
 //     uint64_t pkt_cnt;
 //     uint64_t byte_cnt;
@@ -163,8 +177,6 @@ union flow_key
 #define ALL_32_BITS 0xffffffff
 #define BIT_8_TO_15 0x0000ff00
 static rte_xmm_t mask_v4;
-
-#define FLOW_MAX 1 * 1024 * 1024
 
 static inline xmm_t mask_key(void *key, xmm_t mask)
 {
@@ -190,11 +202,25 @@ static void print_flow_key(const union flow_key *key)
            rte_be_to_cpu_16(key->port_dst), key->proto);
 }
 
+static inline struct flow *
+find_flow(struct lcore_conf *qconf, const union flow_key *key, uint32_t hash)
+{
+    struct flow *f = qconf->buckets[hash];
+    while (NULL != f) {
+        if (0 == memcmp(key, &f->key, sizeof(union flow_key)))
+            break;
+        f = f->next;
+    }
+
+    return f;
+}
+
 static void process_flow_table(struct lcore_conf *qconf, struct rte_mbuf *m)
 {
-    int ret, lock_free = lock_free_on;
-    unsigned lcore_id = rte_lcore_id();
+    // int ret;
     union flow_key key;
+    struct flow *f;
+    uint32_t hash;
 
     key.xmm = mask_key(rte_pktmbuf_mtod(m, void *) + RTE_ETHER_HDR_LEN +
                            offsetof(struct rte_ipv4_hdr, time_to_live),
@@ -210,35 +236,22 @@ static void process_flow_table(struct lcore_conf *qconf, struct rte_mbuf *m)
         key.port_dst = port_tmp;
     }
 
-    if (lock_free) {
-        rte_rcu_qsbr_thread_online(l2fwd_main.rcu_config->v, lcore_id);
-    }
-    ret = rte_hash_lookup(l2fwd_main.flow_table, &key);
-    if (lock_free) {
-        rte_rcu_qsbr_quiescent(l2fwd_main.rcu_config->v, lcore_id);
-        rte_rcu_qsbr_thread_offline(l2fwd_main.rcu_config->v, lcore_id);
-    }
+    hash = rte_jhash(&key, sizeof(union flow_key), 0xfee1900d);
+    hash &= qconf->bucket_mask;
+    f = find_flow(qconf, &key, hash);
+    if (NULL == f) {
+        if (unlikely(rte_mempool_get(qconf->mempool, (void **)&f) != 0))
+            rte_exit(EXIT_FAILURE, "can't alloc flow from mempool\n");
 
-    if (ret < 0) {
-        // print_flow_key(&key);
-        if (rte_hash_add_key(l2fwd_main.flow_table, &key) < 0) {
-            rte_exit(EXIT_FAILURE, "table add key failed, flow_count: %d\n",
-                     rte_atomic32_read(&l2fwd_main.flow_count));
-        }
-        rte_atomic32_inc(&l2fwd_main.flow_count);
+        f->key = key;
+        FLOW_HASH_LIST_ADD_TAIL(f, qconf->buckets[hash]);
+        qconf->flow_count++;
     }
 }
 
-static void print_flow_table(const struct rte_hash *t)
+static void print_flow_table(const struct flow **buckets)
 {
-    uint32_t next = 0;
-    const union flow_key *key;
-    void *data;
-
-    while (rte_hash_iterate(t, (const void **)&key, &data, &next) >= 0) {
-        printf("%u\t", next);
-        print_flow_key(key);
-    }
+    /** @todo XXX */
 }
 
 struct lcore_params
@@ -384,50 +397,41 @@ static int init_lcore_rx_queues(void)
 
 static void init_l2fwd_main(int socket_id)
 {
-    uint8_t extra_flag = 0;
-    struct rte_hash_parameters ipv4_table_params = {
-        .name = "flow_table",
-        .entries = FLOW_MAX,
-        .key_len = sizeof(union flow_key),
-        // .hash_func = rte_jhash,  // ipv4_hash_crc,
-        .hash_func_init_val = 0xfee1900d,
-        .socket_id = socket_id,
-    };
+    struct lcore_conf *qconf;
+    unsigned lcore_id, flow_count, bucket_count;
+    char name[32];
 
     mask_v4 = (rte_xmm_t){
         .u32 = {BIT_8_TO_15, ALL_32_BITS, ALL_32_BITS, ALL_32_BITS}};
 
-    if (lock_free_on)
-        extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF |
-                     RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD;
-    else
-        extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY |
-                     RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD;
+    flow_count = flow_per_lcore;
+    bucket_count = rte_align32pow2(flow_count * flow_bucket_ratio);
 
-    ipv4_table_params.extra_flag = extra_flag;
-    l2fwd_main.flow_table = rte_hash_create(&ipv4_table_params);
-    if (NULL == l2fwd_main.flow_table)
-        rte_exit(EXIT_FAILURE, "create ipv4 flow table failed\n");
+    for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+        if (rte_lcore_is_enabled(lcore_id) == 0)
+            continue;
+        qconf = &lcore_conf[lcore_id];
 
-    if (lock_free_on) {
-        size_t sz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
-        struct rte_rcu_qsbr *rv = (struct rte_rcu_qsbr *)rte_zmalloc_socket(
-            NULL, sz, RTE_CACHE_LINE_SIZE, socket_id);
-        if (rte_rcu_qsbr_init(rv, RTE_MAX_LCORE) != 0)
-            rte_exit(EXIT_FAILURE, "QSBR Variable init failed\n");
+        snprintf(name, 32, "flow_table_%u", lcore_id);
+        qconf->buckets = (struct flow **)rte_zmalloc_socket(
+            name, bucket_count * sizeof(struct flow *), RTE_CACHE_LINE_SIZE,
+            socket_id);
+        if (NULL == qconf->buckets)
+            rte_exit(EXIT_FAILURE,
+                     "create ipv4 flow buckets failed on lcore %u\n", lcore_id);
 
-        l2fwd_main.rcu_config =
-            (struct rte_hash_rcu_config *)rte_zmalloc_socket(
-                NULL, sizeof(struct rte_hash_rcu_config), RTE_CACHE_LINE_SIZE,
-                socket_id);
-        l2fwd_main.rcu_config->v = rv;
+        snprintf(name, 32, "flow_mempool_%u", lcore_id);
+        qconf->mempool = rte_mempool_create(
+            name, flow_count, sizeof(struct flow), 0, 0, NULL, NULL, NULL, NULL,
+            socket_id, MEMPOOL_F_SP_PUT | MEMPOOL_F_SC_GET);
+        if (NULL == qconf->mempool)
+            rte_exit(EXIT_FAILURE,
+                     "create ipv4 flow mempool failed on lcore %u\n", lcore_id);
 
-        if (rte_hash_rcu_qsbr_add(l2fwd_main.flow_table,
-                                  l2fwd_main.rcu_config) < 0)
-            rte_exit(EXIT_FAILURE, "RCU init in hash failed\n");
+        qconf->bucket_count = bucket_count;
+        qconf->bucket_mask = qconf->bucket_count - 1;
+        qconf->flow_count = 0;
     }
-
-    rte_atomic32_init(&l2fwd_main.flow_count);
 }
 
 /* display usage */
@@ -442,8 +446,9 @@ static void print_usage(const char *prgname)
         " [--enable-jumbo [--max-pkt-len PKTLEN]]"
         " [--no-numa]"
         " [--ipv6]"
-        " [--parse-ptype]"
-        " [--lock-free]\n\n"
+        " [--flow-per-lcore N]"
+        " [--flow-bucket-ratio N]"
+        " [--parse-ptype]\n\n"
 
         "  -p PORTMASK: Hexadecimal bitmask of ports to configure\n"
         "  -P : Enable promiscuous mode\n"
@@ -453,8 +458,9 @@ static void print_usage(const char *prgname)
         "                 maximum packet length in decimal (64-9600)\n"
         "  --no-numa: Disable numa awareness\n"
         "  --ipv6: Set if running ipv6 packets\n"
-        "  --parse-ptype: Set to use software to analyze packet type\n"
-        "  --lock-free: use lock-free rte_hash\n\n",
+        "  --flow-per-lcore: Set flow count per lcore, DEFAULT 1024*1024\n"
+        "  --flow-bucket-ratio: Set flow bucket ratio, DEFAULT 2\n"
+        "  --parse-ptype: Set to use software to analyze packet type\n\n",
         prgname);
 }
 
@@ -576,8 +582,9 @@ static void parse_eth_dest(const char *optarg)
 #define CMD_LINE_OPT_ETH_DEST "eth-dest"
 #define CMD_LINE_OPT_NO_NUMA "no-numa"
 #define CMD_LINE_OPT_IPV6 "ipv6"
+#define CMD_LINE_OPT_FLOW_PER_LCORE "flow-per-lcore"
+#define CMD_LINE_OPT_FLOW_BUCKET_RATIO "flow-bucket-ratio"
 #define CMD_LINE_OPT_PARSE_PTYPE "parse-ptype"
-#define CMD_LINE_OPT_LOCK_FREE "lock-free"
 
 /*
  * This expression is used to calculate the number of mbufs needed
@@ -605,10 +612,14 @@ static int parse_args(int argc, char **argv)
         {CMD_LINE_OPT_ETH_DEST, 1, 0, 0},
         {CMD_LINE_OPT_NO_NUMA, 0, 0, 0},
         {CMD_LINE_OPT_IPV6, 0, 0, 0},
+        {CMD_LINE_OPT_FLOW_PER_LCORE, 1, 0, 0},
+        {CMD_LINE_OPT_FLOW_BUCKET_RATIO, 1, 0, 0},
         {CMD_LINE_OPT_PARSE_PTYPE, 0, 0, 0},
-        {CMD_LINE_OPT_LOCK_FREE, 0, 0, 0},
         {NULL, 0, 0, 0},
     };
+
+    char *end = NULL;
+    unsigned long ul_val;
 
     argvopt = argv;
 
@@ -702,16 +713,36 @@ static int parse_args(int argc, char **argv)
                        (unsigned int)port_conf.rxmode.max_rx_pkt_len);
             }
 #endif
+
+            if (!strncmp(lgopts[option_index].name, CMD_LINE_OPT_FLOW_PER_LCORE,
+                         sizeof(CMD_LINE_OPT_FLOW_PER_LCORE))) {
+                /* parse decimal string */
+                ul_val = strtoul(optarg, &end, 10);
+                if ((optarg[0] == '\0') || (end == NULL) || (*end != '\0') ||
+                    ul_val == 0) {
+                    printf("flow-per-lcore %lu invalid\n", ul_val);
+                    return -1;
+                }
+                flow_per_lcore = ul_val;
+            }
+
+            if (!strncmp(lgopts[option_index].name,
+                         CMD_LINE_OPT_FLOW_BUCKET_RATIO,
+                         sizeof(CMD_LINE_OPT_FLOW_BUCKET_RATIO))) {
+                /* parse decimal string */
+                ul_val = strtoul(optarg, &end, 10);
+                if ((optarg[0] == '\0') || (end == NULL) || (*end != '\0') ||
+                    ul_val == 0) {
+                    printf("flow-bucket-ratio %lu invalid\n", ul_val);
+                    return -1;
+                }
+                flow_bucket_ratio = ul_val;
+            }
+
             if (!strncmp(lgopts[option_index].name, CMD_LINE_OPT_PARSE_PTYPE,
                          sizeof(CMD_LINE_OPT_PARSE_PTYPE))) {
                 printf("soft parse-ptype is enabled\n");
                 parse_ptype = 1;
-            }
-
-            if (!strncmp(lgopts[option_index].name, CMD_LINE_OPT_LOCK_FREE,
-                         sizeof(CMD_LINE_OPT_LOCK_FREE))) {
-                printf("lock-free is enabled\n");
-                lock_free_on = 1;
             }
 
             break;
@@ -981,12 +1012,6 @@ static int worker_loop(__attribute__((unused)) void *arg)
         return 0;
     }
 
-    if (lock_free_on) {
-        if (rte_rcu_qsbr_thread_register(l2fwd_main.rcu_config->v, lcore_id) !=
-            0)
-            rte_exit(EXIT_FAILURE, "Register thread %u failed\n", lcore_id);
-    }
-
     RTE_LOG(INFO, L2FWD, "entering main loop on lcore %u\n", lcore_id);
 
     for (i = 0; i < qconf->n_rx_queue; i++) {
@@ -1041,9 +1066,6 @@ static int worker_loop(__attribute__((unused)) void *arg)
         }
     }
 
-    if (lock_free_on)
-        rte_rcu_qsbr_thread_unregister(l2fwd_main.rcu_config->v, lcore_id);
-
     return 0;
 }
 
@@ -1056,6 +1078,11 @@ int main(int argc, char **argv)
     unsigned nb_ports, lcore_id, socket_id;
     uint32_t n_tx_queue, nb_lcores;
     uint16_t port_id, queue_id, nb_rx_queue, queue;
+
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return 0;
+    }
 
     /* init EAL */
     ret = rte_eal_init(argc, argv);
@@ -1192,7 +1219,8 @@ int main(int argc, char **argv)
             else
                 socket_id = 0;
 
-            printf("rxq: %u,%u,%u,%u\n", port_id, queue_id, lcore_id, socket_id);
+            printf("rxq: %u,%u,%u,%u\n", port_id, queue_id, lcore_id,
+                   socket_id);
             fflush(stdout);
 
             ret = rte_eth_rx_queue_setup(port_id, queue_id, nb_rxd, socket_id,
@@ -1270,21 +1298,22 @@ int main(int argc, char **argv)
             printf("  port%d rx: %16lu    tx: %16lu\n", port_id,
                    qconf->rx_pkt_cnt[port_id], qconf->tx_pkt_cnt[port_id]);
         }
+        printf("  flow count: %u\n", qconf->flow_count);
+#ifdef DEBUG
+        print_flow_table(qconf->buckets);
+#endif
         printf(
             "-------------------------------------------------------------\n");
     }
 #endif
 
-    printf("flow count: %d, total: %d\n",
-           rte_atomic32_read(&l2fwd_main.flow_count), FLOW_MAX);
-#ifdef DEBUG
-    print_flow_table(l2fwd_main.flow_table);
-#endif
 
-    rte_hash_free(l2fwd_main.flow_table);
-    if (l2fwd_main.rcu_config) {
-        rte_free(l2fwd_main.rcu_config->v);
-        rte_free(l2fwd_main.rcu_config);
+    for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+        if (rte_lcore_is_enabled(lcore_id) == 0)
+            continue;
+        qconf = &lcore_conf[lcore_id];
+        rte_mempool_free(qconf->mempool);
+        rte_free(qconf->buckets);
     }
 
     /* stop ports */
