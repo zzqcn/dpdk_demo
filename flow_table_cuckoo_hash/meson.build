@@ -8,6 +8,7 @@ add_project_arguments('-DALLOW_EXPERIMENTAL_API', language: 'c')
 dpdk_dep = declare_dependency(
     dependencies: dependency('libdpdk'),
     link_args: [
+        '-Wl,--no-as-needed',
         '-L/usr/local/lib64',
         '-lrte_net_vmxnet3',
         '-lrte_net_ixgbe',
