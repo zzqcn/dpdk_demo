@@ -1,0 +1,7 @@
+# file format:
+# src_ip/masklen dst_ip/masklen src_port dst_port proto pkt_len action/arg priority
+#
+# If you don't care any field, just set it to 0.
+
+1.2.3.4/32  0.0.0.0/0   12345 0 6 0   drop/0  100
+5.6.7.8/24  0.0.0.0/0   0     0 0 53  mark/8  99
