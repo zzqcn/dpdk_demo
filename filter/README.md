@@ -4,7 +4,7 @@
 
 不同于 rte_flow, 此示例使用基于 DPDK ACL 实现基于软件的流量过滤. rte_flow 需要利用网卡能力, 不同网卡支持的能力不同.
 
-为了可在硬件条件有限的机器上运行, 此示例使用 libpcap PMD 运行, 不需要实体网卡, 只需指定 pcap 文件即可.
+为了能在受限环境运行, 本示例在编写时刻意降低了硬件要求, 不需要多个 CPU 核, 也不需要实际网卡, 使用 DPDK 虚拟设备功能(vdev)即可把 pcap 文件做为报文输入源.
 
 限于篇幅, 此说明文件不涉及太多原理, 详见[我的语雀文章](https://www.yuque.com/zzqcn/dpdk/slw9r2).
 
@@ -13,11 +13,19 @@
 程序由几个部分组成:
 
 - decode 简单解析报文, 仅支持简单 Ether 封装
-- filter 过滤规则解析, 编译和运行时匹配, 仅支持 IPv4 规则. 规则的模式(pattern)支持 IP 源地址/目的地址, 源端口/目的端口, 协议号, 报文长度, 动作(action)支持丢包(drop), 打标记(mark), 直接转发(forward), 分发(dispatch). 目前代码中没有真正执行动作, 只是打印出来
+- filter 过滤规则解析, 编译和运行时匹配
 - l2fwd 简单二层转发
 - main DPDK 主程序, 负责初始化 EAL, 内存, 网卡, 启动程序等
 
-``genpkt.py`` 用于生成测试报文(基于 Scapy).
+另有两个文件
+- ``rules.txt`` 过滤规则文件
+- ``genpkt.py`` 用于生成测试报文(基于 Scapy).
+
+因为仅演示原理, 代码做了以下简化:
+
+- 仅支持 IPv4 规则
+- 只基于外层 IP/端口进行匹配
+- 匹配规则后并没有真正执行动作, 只是打印出来
 
 运行时报文路径:
 
@@ -53,7 +61,7 @@ $ninja -C build # 或 cd build; ninja
 其他参数含义参考 DPDK EAL 参数.
 
 ```bash
-$./filter -l 0,1 -n 4 --vdev 'net_pcap0,rx_pcap=../test.pcap' -- -p 0x1 --config '(0,0,1)' --rule '../rules.txt'
+$./filter -l 0 -n 4 --vdev 'net_pcap0,rx_pcap=../test.pcap' -- -p 0x1 --config '(0,0,0)' --rule '../rules.txt'
 ```
 
 程序启动后加载过滤规则文件, 并打印其中的规则, 如
@@ -80,6 +88,8 @@ FILTER: Parsed 2 rules
   - mark 给报文打标记, 参数为要打的标记值
   - forward 将报文直接从指定网口转发, 参数为发送网口号
   - dispatch 将报文分发到指定 CPU 核处理, 参数为 CPU 核编号
+
+pattern 中不关心的字段, 在满足字段格式的情况下写 0 即可, 如``0.0.0.0/0``.
 
 规则文件语法示例:
 ```

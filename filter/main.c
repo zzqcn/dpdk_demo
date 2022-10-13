@@ -659,8 +659,8 @@ int main(int argc, char **argv) {
     rte_exit(EXIT_FAILURE, "check_port_config failed\n");
 
   nb_lcores = rte_lcore_count();
-  if (nb_lcores % 2)
-    rte_exit(EXIT_FAILURE, "lcores count must be even number\n");
+  // if (nb_lcores % 2)
+  //   rte_exit(EXIT_FAILURE, "lcores count must be even number\n");
 
   nb_ports = rte_eth_dev_count_avail();
 

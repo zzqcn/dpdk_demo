@@ -70,12 +70,12 @@ static void show_rules(filter_rule_context_t *rctx) {
   }
 }
 
-filter_rule_t *filter_rule_new(void) {
+static filter_rule_t *new_rule(void) {
   filter_rule_t *rule = rte_zmalloc("filter_rule", sizeof(filter_rule_t), 0);
   return rule;
 }
 
-void filter_rule_free(filter_rule_t *rule) {
+static void free_rule(filter_rule_t *rule) {
   if (NULL == rule)
     return;
   rte_free(rule);
@@ -88,7 +88,7 @@ static const filter_rule_t *get_rule_by_id(const filter_rule_context_t *rctx, ui
   return rctx->rule_map[id];
 }
 
-static int filter_rule_add(filter_rule_context_t *rctx, filter_rule_t *rule) {
+static int add_rule(filter_rule_context_t *rctx, filter_rule_t *rule) {
   if (rctx->rule_count >= FILTER_RULE_MAX) {
     return -1;
   }
@@ -458,14 +458,14 @@ static inline int is_bypass_line(char *buff) {
   return 1;
 }
 
-static uint32_t convert_depth_to_bitmask(uint32_t depth_val) {
-  uint32_t bitmask = 0;
-  int i, j;
+// static uint32_t convert_depth_to_bitmask(uint32_t depth_val) {
+//   uint32_t bitmask = 0;
+//   int i, j;
 
-  for (i = depth_val, j = 0; i > 0; i--, j++)
-    bitmask |= (1 << (31 - j));
-  return bitmask;
-}
+//   for (i = depth_val, j = 0; i > 0; i--, j++)
+//     bitmask |= (1 << (31 - j));
+//   return bitmask;
+// }
 
 /* Reads file and calls the add_classify_rule function. 8< */
 // static int add_rules(const char *rule_path, struct flow_classifier *cls_app) {
@@ -501,14 +501,14 @@ int filter_load_rules(const char *rule_path) {
       break;
     }
 
-    rule = filter_rule_new();
+    rule = new_rule();
     if (NULL == rule)
       return -1;
 
     if (parse_ipv4_rule(buff, rule) != 0)
       rte_exit(EXIT_FAILURE, "%s Line %u: parse rules error\n", rule_path, i);
 
-    filter_rule_add(g_filter_ctx, rule);
+    add_rule(g_filter_ctx, rule);
     total_num++;
   }
 
